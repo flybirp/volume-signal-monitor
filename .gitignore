@@ -1,0 +1,12 @@
+# 运行时产物
+cache/
+output/
+__pycache__/
+*.pyc
+*.parquet
+
+# 凭据（tushare token 文件，勿提交）
+.tushare_token
+
+# 系统
+.DS_Store

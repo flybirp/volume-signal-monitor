@@ -607,6 +607,19 @@ def write_html(hits, monitor_date=None):
     html_path = os.path.join(OUT_DIR, "巨量阳K低位_监控报告.html")
     md = parse_date_arg(monitor_date).strftime("%Y-%m-%d")
 
+    # 低位档分布统计
+    from collections import Counter
+    tier_counts = Counter(r.get("low_tier", "未知") for r in hits)
+    tier_order = [
+        ("极深(<15%)", "#e74c3c"),
+        ("深度(15-35%)", "#e67e22"),
+        ("低位(35-55%)", "#f1c40f"),
+    ]
+    tier_chips = " ".join(
+        f'<span class="tier" style="background:{color}">{name.replace("<", "&lt;")} × {tier_counts.get(name, 0)} 只</span>'
+        for name, color in tier_order
+    )
+
     rows_html = []
     for i, r in enumerate(hits):
         chart = r.get("chart", "")
@@ -651,6 +664,7 @@ tr:nth-child(even){{background:#181818;}}
 <h1>巨量阳K·低位监控报告</h1>
 <h2>三条件 AND：①量>前20日均量×2 且 收盘>开盘×1.04 ②量>300日95分位 ③收盘<300日55分位（近30日取最近发生日）</h2>
 <p class="summary">监控日 <b style="color:#ff6a00">{md}</b> | 命中 <b style="color:#ff6a00">{len(hits)}</b> 只 | 生成时间 {datetime.now().strftime('%Y-%m-%d %H:%M')} | 按「量能/95分位比值」降序</p>
+<p class="summary">低位档分布：{tier_chips}</p>
 <table>
 <thead><tr>
 <th>#</th><th>代码</th><th>名称</th><th>主营业务</th><th>绑定度最高概念</th><th>发生日</th><th>交易额</th><th>量能/95分位</th><th>低位档</th><th>近一年价格走势+成交额</th>

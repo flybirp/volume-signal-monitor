@@ -25,6 +25,9 @@ export TUSHARE_TOKEN="你的token"
 # 3. 全市场扫描（监控日 = 系统今天）
 python3 scripts/market_volume_signal.py scan --refresh
 
+# tushare 无权限时改用 westock 源（约 25 分钟）
+python3 scripts/market_volume_signal.py scan --refresh --source westock
+
 # 自定义监控日（截至 2024-09-24）
 python3 scripts/market_volume_signal.py scan --refresh --date 20240924
 
@@ -39,12 +42,39 @@ python3 scripts/market_volume_signal.py check sz300866 --date 20240924
 - HTML 报告：`output/巨量阳K低位_监控报告.html`
 - 走势图：`output/{代码}_{发生日}.png`（价格 K 线 + 成交额副图）
 
-## 数据源
+## 数据源（三级兜底）
 
 | 能力 | 数据源 |
 | --- | --- |
-| 全市场日线底座 + 前复权因子 | tushare pro |
-| 主营业务 + 概念绑定度 | westock CLI |
+| 全市场日线底座（①→②→③ 自动兜底） | ① tushare pro（60~90 秒，需 token + 接口权限）<br>② 腾讯行情 `web.ifzq.gtimg.cn`（并发快，高频会被 WAF 封）<br>③ westock CLI `kline` 批量（≤20 代码/次，QPM≈10，~25 分钟） |
+| 股票清单（代码 + 名称） | westock CLI `screen condition` |
+| 主营业务 + 概念绑定度 | westock CLI `profile` / `industry-chain stock` |
+
+用 `--source auto|tushare|tx|westock` 手动指定，默认 `auto`。
+
+> ⚠️ 实测提醒：tushare token 的接口权限可能失效（返回 `40203 没有接口访问权限`），
+> 腾讯/东财行情接口连续几千次请求会被封。当前最稳的是 `--source westock`。
+
+## 常用命令
+
+```bash
+# 全市场扫描（tushare 不可用时直接指定 westock 源）
+python3 scripts/market_volume_signal.py scan --refresh --source westock --date 20261009
+
+# 补漏：只抓缓存里缺失的股票（westock 限流时是整批 20 只一起丢，必做）
+python3 scripts/market_volume_signal.py fill --date 20261009 --per-min 6 --workers 2
+
+# 补完再扫一次（不加 --refresh，用缓存）+ 串行补字段
+python3 scripts/market_volume_signal.py scan --date 20261009 --workers 1
+```
+
+## 数据口径坑（详见 SKILL.md）
+
+- **科创板（688/689）的 `volume` 单位是「股」**，主板 / 创业板是「手」——腾讯行情与 westock 都是这个口径。
+  不换算会让成交额虚高 100 倍。
+- 价格统一**前复权**；不复权数据在除权日会产生「假跳空」，污染「低位」判断。
+- westock 补字段（profile / industry-chain）**并发会返回降级数据**（概念关联度变 0），大批量请用 `--workers 1`。
+- westock 产业链覆盖率约 50%，「未找到所属产业链」属正常，不是抓取失败。
 
 ## 目录结构
 

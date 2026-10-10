@@ -12,9 +12,11 @@
   代码 | 名称 | 主营业务 | 绑定度最高概念 | 发生日交易额 | 量能/95分位比值 | 近一年价格走势+成交额 | 低位档
 
 数据源分工：
-  - 全市场日线底座：tushare（批量，30~90 秒，唯一有全市场批量日线能力）
+  - 全市场日线底座：tushare（批量，30~90 秒）
+      * tushare 无权限/报错时自动兜底到「腾讯行情 web.ifzq.gtimg.cn」（并发拉，~90 秒，前复权）
   - 主营业务 + 概念绑定度：westock（profile.business + industry-chain 关联度 1-10）
-  - 交易额：tushare daily.amount（单位：千元）
+  - 交易额：tushare daily.amount（单位：千元）；腾讯路径为估算值（量×100×(开+收)/2），
+    命中个股会再用 westock kline 取精确成交额覆盖
 
 用法:
   python market_volume_signal.py scan                 # 全市场扫描（监控日=系统今天）
@@ -30,13 +32,20 @@ import numpy as np
 import pandas as pd
 import os
 import sys
+import re
 import json
 import time
+import threading
 import argparse
 import subprocess
 import shutil
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+try:
+    import requests  # 腾讯行情兜底数据源需要
+except ImportError:
+    requests = None
 
 import matplotlib
 matplotlib.use("Agg")
@@ -201,21 +210,375 @@ def load_cached_market_daily(end_date=None):
 
 
 # ============================================================
-# 数据获取：westock（主营业务 + 概念绑定度）
+# 数据获取：腾讯行情（tushare 不可用时的全市场日线兜底）
 # ============================================================
+TX_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+TX_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+    "Referer": "https://gu.qq.com/",
+}
+A_SHARE_RE = re.compile(r"^(60|68|00|30)\d{4}\.(SH|SZ)$")
+
+
+def _parse_md_table(out):
+    """解析 westock 的 markdown 表格输出 -> list[dict]"""
+    rows, header = [], None
+    for line in out.splitlines():
+        s = line.strip()
+        if not s.startswith("|"):
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        if all(set(c) <= set("-: ") for c in cells):
+            continue
+        if header is None:
+            header = cells
+            continue
+        rows.append(dict(zip(header, cells)))
+    return rows
+
+
+def westock_to_ts(wcode):
+    """sh600519 -> 600519.SH"""
+    m = re.match(r"^(sh|sz|bj)(\d{6})$", wcode.lower())
+    if not m:
+        return ""
+    return f"{m.group(2)}.{m.group(1).upper()}"
+
+
 def ts_to_westock(ts_code):
     """600519.SH -> sh600519"""
     num, ex = ts_code.split(".")
     return ex.lower() + num
 
 
-def _run_westock(args, timeout=30):
+def fetch_universe(end_date=None):
+    """全 A 股代码+名称清单。来源 westock screen condition，缓存到 cache/universe_{YYYYMMDD}.csv。
+
+    返回 DataFrame[ts_code, name]；失败时回退到任意已有缓存。
+    """
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    end_str = parse_date_arg(end_date).strftime("%Y%m%d")
+    cache_path = os.path.join(CACHE_DIR, f"universe_{end_str}.csv")
+
+    if os.path.exists(cache_path):
+        return pd.read_csv(cache_path, dtype=str)
+
+    dstr = parse_date_arg(end_date).strftime("%Y-%m-%d")
+    out = _run_westock(
+        ["screen", "condition", "--expression", "intersect([PE_TTM > -1000000])",
+         "--market", "hs", "--date", dstr, "--limit", "6000"], timeout=90)
+    rows = _parse_md_table(out)
+    recs = []
+    for r in rows:
+        wcode = (r.get("code") or "").lower()
+        ts = westock_to_ts(wcode)
+        if ts and A_SHARE_RE.match(ts):
+            recs.append({"ts_code": ts, "name": r.get("name", "")})
+    if not recs:
+        # 回退：任意已有 universe 缓存
+        olds = sorted(f for f in os.listdir(CACHE_DIR)
+                      if f.startswith("universe_") and f.endswith(".csv"))
+        if olds:
+            print(f"⚠️ westock 获取股票清单失败，回退缓存 {olds[-1]}", flush=True)
+            return pd.read_csv(os.path.join(CACHE_DIR, olds[-1]), dtype=str)
+        raise RuntimeError("无法获取全 A 股清单（westock screen condition 失败且无缓存）")
+
+    df = pd.DataFrame(recs).drop_duplicates("ts_code")
+    df.to_csv(cache_path, index=False, encoding="utf-8-sig")
+    print(f"股票清单: {len(df)} 只（截至 {dstr}）-> {cache_path}", flush=True)
+    return df
+
+
+def load_universe_names(end_date=None):
+    """读取 ≤ 监控日 的最新 universe 缓存 -> {ts_code: {'name':..., 'industry':''}}"""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    end_str = parse_date_arg(end_date).strftime("%Y%m%d")
+    olds = sorted(f for f in os.listdir(CACHE_DIR)
+                  if f.startswith("universe_") and f.endswith(".csv")
+                  and f.replace("universe_", "").replace(".csv", "") <= end_str)
+    if not olds:
+        return {}
+    df = pd.read_csv(os.path.join(CACHE_DIR, olds[-1]), dtype=str)
+    return {r["ts_code"]: {"name": r.get("name", ""), "industry": ""} for _, r in df.iterrows()}
+
+
+def _tx_kline_one(mk, bars, retries=3):
+    """腾讯单只前复权日线 -> list[tuple]。mk 形如 sh600519
+
+    ★ 单位坑：科创板（688/689）腾讯返回的 volume 单位是「股」，沪/深主板与创业板是「手」。
+      已按板块换算成统一口径（手），成交额 = 股数 × (开+收)/2（前复权量价相乘即还原真实成交额）。
+    """
+    if requests is None:
+        raise RuntimeError("缺少 requests 库，无法使用腾讯行情兜底（pip install requests）")
+    num = re.sub(r"^(sh|sz|bj)", "", mk)
+    shares_unit = num.startswith("68")  # 科创板：股
+    for a in range(retries):
+        try:
+            r = requests.get(TX_URL, params={"param": f"{mk},day,,,{bars},qfq"},
+                             headers=TX_HEADERS, timeout=12)
+            d = (r.json().get("data") or {}).get(mk) or {}
+            k = d.get("qfqday") or d.get("day") or []
+            out = []
+            for it in k:
+                if len(it) < 6:
+                    continue
+                o, c, h, l, v = float(it[1]), float(it[2]), float(it[3]), float(it[4]), float(it[5])
+                shares = v if shares_unit else v * 100.0        # 股数
+                vol_hand = v / 100.0 if shares_unit else v      # 统一为「手」
+                # 腾讯无成交额字段：股数 × (开+收)/2 估算（元 -> 千元）
+                amt_1000 = shares * (o + c) / 2.0 / 1000.0
+                out.append((westock_to_ts(mk), int(it[0].replace("-", "")), o, h, l, c, vol_hand, amt_1000))
+            return out
+        except Exception:
+            time.sleep(0.4 * (a + 1))
+    return []
+
+
+class _RateLimiter:
+    """简单全局限速器（每分钟最多 per_min 次）"""
+    def __init__(self, per_min):
+        self.interval = 60.0 / max(per_min, 1)
+        self._last = 0.0
+        self._lock = threading.Lock()
+
+    def wait(self):
+        with self._lock:
+            now = time.time()
+            gap = self.interval - (now - self._last)
+            if gap > 0:
+                time.sleep(gap)
+            self._last = time.time()
+
+
+def _westock_batch_kline(mks, end_dt, bars, limiter, retries=4):
+    """westock kline 批量（≤20 代码/次，前复权）-> list[tuple]
+
+    westock 对 kline 批量有 QPM 限制，超限会返回「状态: error」，这里做退避重试。
+    """
+    start_dt = end_dt - timedelta(days=int(bars * 1.7) + 60)
+    args = ["kline", ",".join(mks), "--period", "day",
+            "--start", fmt_date_arg(start_dt), "--end", fmt_date_arg(end_dt),
+            "--limit", str(bars), "--fq", "qfq"]
+    for a in range(retries):
+        limiter.wait()
+        out = _run_westock(args, timeout=90, retries=0)
+        if not out:
+            time.sleep(5)
+            continue
+        if "状态: error" in out or out.strip().startswith("错误"):
+            time.sleep(10 * (a + 1))
+            continue
+        rows = []
+        for r in _parse_md_table(out):
+            mk = (r.get("code") or "").lower()
+            ts = westock_to_ts(mk)
+            if not ts or not A_SHARE_RE.match(ts):
+                continue
+            try:
+                o = float(r["open"]); c = float(r["last"])
+                h = float(r["high"]); l = float(r["low"]); v = float(r["volume"])
+                amt = float(r.get("amount") or 0) / 1000.0  # 元 -> 千元
+            except Exception:
+                continue
+            # 科创板 westock/腾讯返回的 volume 单位是「股」，其余是「手」
+            if ts.startswith("68"):
+                v = v / 100.0
+            rows.append((ts, int(r["date"].replace("-", "")), o, h, l, c, v, amt))
+        if rows:
+            return rows
+        time.sleep(5)
+    return []
+
+
+def fetch_full_market_daily_westock(end_date=None, workers=4, bars=None, per_min=10):
+    """westock 批量 K 线全市场日线（前复权）。返回与 tushare 路径同 schema 的 DataFrame。
+
+    schema: ts_code, trade_date(int YYYYMMDD), open, high, low, close, vol(手), amount(千元)
+    """
+    end_dt = parse_date_arg(end_date)
+    end_str = end_dt.strftime("%Y%m%d")
+    bars = bars or (SCAN_LOOKBACK + 60)
+    uni = fetch_universe(end_date)
+    mks = [ts_to_westock(c) for c in uni["ts_code"].tolist()]
+    batches = [mks[i:i + 20] for i in range(0, len(mks), 20)]
+    print(f"正在从 westock 批量拉取全市场日线 | 监控日 {end_str} | {len(mks)} 只 / {len(batches)} 批"
+          f"（每批 ≤20 只，限速 {per_min} 批/分钟，预计 {len(batches) / per_min:.0f} 分钟）...", flush=True)
+
+    limiter = _RateLimiter(per_min)
+    out_rows = {}
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_westock_batch_kline, b, end_dt, bars, limiter): i for i, b in enumerate(batches)}
+        done = 0
+        for fut in as_completed(futs):
+            i = futs[fut]
+            try:
+                rows = fut.result()
+            except Exception as e:
+                rows = []
+                print(f"  [WARN] 批次 {i}: {e}", file=sys.stderr, flush=True)
+            for r in rows:
+                out_rows.setdefault(r[0], []).append(r)
+            done += 1
+            if done % 20 == 0 or done == len(batches):
+                print(f"  进度: {done}/{len(batches)} 批 | {len(out_rows)} 只 | {time.time() - t0:.0f}s", flush=True)
+
+    rows = []
+    for ts, rs in out_rows.items():
+        rows.extend(rs)
+    if not rows:
+        print("❌ westock 未取到任何数据")
+        return None
+    df = pd.DataFrame(rows, columns=["ts_code", "trade_date", "open", "high", "low", "close", "vol", "amount"])
+    df = df[df["trade_date"] <= int(end_str)]
+    df = df.drop_duplicates(["ts_code", "trade_date"]).sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
+    print(f"全市场数据: {len(df)} 条 | {df['ts_code'].nunique()} 只股票（westock·前复权，{time.time() - t0:.0f}s）", flush=True)
+
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cache_path = os.path.join(CACHE_DIR, f"market_daily_{end_str}.parquet")
+    df.to_parquet(cache_path, index=False)
+    print(f"缓存已保存: {cache_path}", flush=True)
+    return df
+
+
+def fill_missing_westock(end_date=None, per_min=6, workers=2, bars=None):
+    """补漏：只抓「清单里有、缓存里没有」的股票，合并回当天缓存。
+
+    westock kline 批量触发限流时会整批失败（20 只一起丢），跑完主流程后用它兜底。
+    返回合并后的 DataFrame 或 None。
+    """
+    end_str = parse_date_arg(end_date).strftime("%Y%m%d")
+    cache_path = os.path.join(CACHE_DIR, f"market_daily_{end_str}.parquet")
+    if not os.path.exists(cache_path):
+        print("⚠️ 无缓存，请先跑 scan --refresh")
+        return None
+    cache = pd.read_parquet(cache_path)
+    uni = fetch_universe(end_date)
+    have = set(cache["ts_code"].unique())
+    miss = [c for c in uni["ts_code"].tolist() if c not in have]
+    if not miss:
+        print("✅ 缓存已覆盖全部股票，无需补漏")
+        return cache
+    print(f"补漏：{len(miss)} 只缺失（缓存 {len(have)} 只 / 清单 {len(uni)} 只）", flush=True)
+
+    _orig_universe = fetch_universe
+
+    def _patched(_end=None):
+        return pd.DataFrame({"ts_code": miss, "name": ""})
+
+    globals()["fetch_universe"] = _patched
     try:
-        r = subprocess.run([WESTOCK_BIN] + args, capture_output=True, text=True, timeout=timeout)
-        return r.stdout if r.returncode == 0 else ""
-    except Exception as e:
-        print(f"  [WARN] westock {' '.join(args)}: {e}", file=sys.stderr, flush=True)
-        return ""
+        add = fetch_full_market_daily_westock(end_date=end_str, workers=workers, bars=bars, per_min=per_min)
+    finally:
+        globals()["fetch_universe"] = _orig_universe
+    if add is None or add.empty:
+        print("⚠️ 补漏未取到数据")
+        return cache
+    merged = pd.concat([cache, add], ignore_index=True)
+    merged = merged.drop_duplicates(["ts_code", "trade_date"]).sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
+    merged.to_parquet(cache_path, index=False)
+    print(f"缓存已合并: {merged['ts_code'].nunique()} 只 | {len(merged)} 条 -> {cache_path}", flush=True)
+    return merged
+
+
+def fetch_full_market_daily_tx(end_date=None, workers=12, bars=None):
+    """腾讯行情全市场日线（前复权）。返回与 tushare 路径同 schema 的 DataFrame。
+
+    schema: ts_code, trade_date(int YYYYMMDD), open, high, low, close, vol(手), amount(千元)
+    """
+    end_str = parse_date_arg(end_date).strftime("%Y%m%d")
+    bars = bars or (SCAN_LOOKBACK + 60)
+    uni = fetch_universe(end_date)
+    codes = uni["ts_code"].tolist()
+    mks = [ts_to_westock(c) for c in codes]
+    print(f"正在从腾讯行情拉取全市场日线 | 监控日 {end_str} | {len(mks)} 只 × {bars} 根（前复权）...", flush=True)
+
+    got = {}          # mk -> rows
+    pending = list(mks)
+    t0 = time.time()
+    # 多轮补漏：第 1 轮高并发快取，后续轮次降并发 + 退避，专攻失败/空返回的股票
+    for rnd, (w, sleep_between) in enumerate([(workers, 0.0), (max(4, workers // 3), 3.0), (2, 6.0)]):
+        if not pending:
+            break
+        if rnd > 0:
+            print(f"  补漏第 {rnd} 轮：{len(pending)} 只（并发 {w}）", flush=True)
+        with ThreadPoolExecutor(max_workers=w) as ex:
+            futs = {ex.submit(_tx_kline_one, mk, bars): mk for mk in pending}
+            for i, fut in enumerate(as_completed(futs), 1):
+                mk = futs[fut]
+                try:
+                    r = fut.result()
+                    if r:
+                        got[mk] = r
+                except Exception as e:
+                    print(f"  [WARN] tx kline {mk}: {e}", file=sys.stderr, flush=True)
+                if rnd == 0 and i % 1000 == 0:
+                    print(f"  进度: {i}/{len(pending)} | {time.time() - t0:.0f}s", flush=True)
+                if sleep_between and i % w == 0:
+                    time.sleep(sleep_between)
+        pending = [mk for mk in mks if mk not in got]
+
+    rows = []
+    for mk in mks:
+        rows.extend(got.get(mk, []))
+    if pending:
+        print(f"  ⚠️ {len(pending)} 只股票最终未取到数据（如 {pending[:3]}）", flush=True)
+
+    if not rows:
+        print("❌ 腾讯行情未取到任何数据")
+        return None
+    df = pd.DataFrame(rows, columns=["ts_code", "trade_date", "open", "high", "low", "close", "vol", "amount"])
+    df = df[df["trade_date"] <= int(end_str)]
+    df = df.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
+    print(f"全市场数据: {len(df)} 条 | {df['ts_code'].nunique()} 只股票（腾讯行情·前复权，{time.time() - t0:.0f}s）", flush=True)
+
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cache_path = os.path.join(CACHE_DIR, f"market_daily_{end_str}.parquet")
+    df.to_parquet(cache_path, index=False)
+    print(f"缓存已保存: {cache_path}", flush=True)
+    return df
+
+
+def refine_amount_with_westock(wcode, hit_date):
+    """用 westock kline 取某只股票某日的精确成交额（元），返回千元；失败返回 None。"""
+    out = _run_westock(["kline", wcode, "--period", "day", "--start", hit_date[:4] + "-" + hit_date[4:6] + "-" + hit_date[6:],
+                        "--end", hit_date[:4] + "-" + hit_date[4:6] + "-" + hit_date[6:],
+                        "--limit", "5", "--fq", "qfq"], timeout=40)
+    if not out or "错误" in out:
+        return None
+    for r in _parse_md_table(out):
+        if (r.get("date") or "").replace("-", "") == hit_date:
+            try:
+                return float(r.get("amount", 0)) / 1000.0  # 元 -> 千元
+            except Exception:
+                return None
+    return None
+
+
+# ============================================================
+# 数据获取：westock（主营业务 + 概念绑定度）
+# ============================================================
+
+
+WESTOCK_ERR_MARKS = ("状态: error", "错误:", "限流", "频繁", "超过")
+
+
+def _run_westock(args, timeout=30, retries=2):
+    """调用 westock CLI。命中限流/错误标记时退避重试（westock 有 QPM 限制）。"""
+    for a in range(retries + 1):
+        try:
+            r = subprocess.run([WESTOCK_BIN] + args, capture_output=True, text=True, timeout=timeout)
+            out = r.stdout if r.returncode == 0 else ""
+            if out and any(m in out for m in WESTOCK_ERR_MARKS):
+                if a < retries:
+                    time.sleep(6 * (a + 1))
+                    continue
+            return out
+        except Exception as e:
+            if a == retries:
+                print(f"  [WARN] westock {' '.join(args)}: {e}", file=sys.stderr, flush=True)
+            time.sleep(2)
+    return ""
 
 
 def get_profile(code):
@@ -232,8 +595,36 @@ def get_profile(code):
     return d.get("name", ""), d.get("business", ""), d.get("industry", "")
 
 
-def get_top_concept(code):
-    """westock industry-chain stock -> (绑定度最高概念节点, 关联度, 所属主题)"""
+# westock industry-chain 的列名曾从中文改为英文，两种都要兼容
+NODE_NAME_KEYS = ("节点名称", "nodeName")
+NODE_DEG_KEYS = ("关联度", "correlation")
+THEME_NAME_KEYS = ("主题名称", "themeName")
+
+
+def _first_key(d, keys):
+    for k in keys:
+        if k in d:
+            return d[k]
+    return ""
+
+
+def get_top_concept(code, retries=1):
+    """westock industry-chain stock -> (绑定度最高概念节点, 关联度, 所属主题)
+
+    并发过高时 westock 会返回降级内容（节点名在但关联度全为 0），
+    这里对「有节点但关联度全 0」的情况退避重试一次。
+    """
+    res = _get_top_concept_once(code)
+    for a in range(retries):
+        names, deg, themes = res
+        if names and deg and deg != "0":
+            break
+        time.sleep(5 * (a + 1))
+        res = _get_top_concept_once(code)
+    return res
+
+
+def _get_top_concept_once(code):
     out = _run_westock(["industry-chain", "stock", code])
     if not out:
         return "", "", ""
@@ -271,15 +662,15 @@ def get_top_concept(code):
 
     def degree(n):
         try:
-            return float(n.get("关联度", 0) or 0)
+            return float(_first_key(n, NODE_DEG_KEYS) or 0)
         except Exception:
             return 0.0
 
     best = max(nodes, key=degree)
     top_deg = degree(best)
     top_nodes = [n for n in nodes if degree(n) == top_deg]
-    node_names = "、".join(n.get("节点名称", "") for n in top_nodes[:2])
-    theme_names = "、".join(t.get("主题名称", "") for t in themes[:3])
+    node_names = "、".join(_first_key(n, NODE_NAME_KEYS) for n in top_nodes[:2])
+    theme_names = "、".join(_first_key(t, THEME_NAME_KEYS) for t in themes[:3])
     return node_names, str(int(top_deg)), theme_names
 
 
@@ -464,13 +855,27 @@ def _enrich_one(r, market_df, no_enrich):
     return r
 
 
-def run_scan(limit=None, refresh=False, no_enrich=False, max_enrich=None, top=None, workers=8, end_date=None):
+def run_scan(limit=None, refresh=False, no_enrich=False, max_enrich=None, top=None, workers=8,
+             end_date=None, source="auto"):
+    """source: auto（先 tushare，失败自动切腾讯行情）| tushare | tx（腾讯行情）"""
     market_df = None
     if not refresh:
         market_df = load_cached_market_daily(end_date)
     if market_df is None:
-        print("正在从 tushare 拉取全市场日线（约 60~90 秒）...", flush=True)
-        market_df = fetch_full_market_daily(end_date=end_date)
+        if source in ("auto", "tushare"):
+            print("正在从 tushare 拉取全市场日线（约 60~90 秒）...", flush=True)
+            try:
+                market_df = fetch_full_market_daily(end_date=end_date)
+            except Exception as e:
+                market_df = None
+                print(f"⚠️ tushare 拉取失败：{str(e)[:120]}", flush=True)
+                if source == "auto":
+                    print("   -> 自动切换到腾讯行情数据源", flush=True)
+        if market_df is None and source in ("auto", "tx"):
+            market_df = fetch_full_market_daily_tx(end_date=end_date)
+        if market_df is None and source in ("auto", "tx", "westock"):
+            print("   -> 腾讯行情不可用，改用 westock 批量 K 线（较慢，限速）", flush=True)
+            market_df = fetch_full_market_daily_westock(end_date=end_date)
     if market_df is None:
         print("❌ 无法获取数据")
         return []
@@ -479,13 +884,15 @@ def run_scan(limit=None, refresh=False, no_enrich=False, max_enrich=None, top=No
     latest_date = market_df["trade_date"].max()
     print(f"\n巨量阳K·低位监控 | 监控日 {monitor_date.strftime('%Y-%m-%d')} | 数据截至 {latest_date}", flush=True)
 
-    # 股票信息（名称）
+    # 股票信息（名称）：tushare 优先，失败回退 universe 缓存
     try:
         pro = get_tushare_pro()
         stock_info = pro.stock_basic(exchange="", list_status="L", fields="ts_code,name,industry")
         info_map = {r["ts_code"]: {"name": r["name"], "industry": r["industry"]} for _, r in stock_info.iterrows()}
     except Exception:
         info_map = {}
+    if not info_map:
+        info_map = load_universe_names(end_date)
 
     ts_codes = market_df["ts_code"].unique()
     if limit:
@@ -494,12 +901,15 @@ def run_scan(limit=None, refresh=False, no_enrich=False, max_enrich=None, top=No
     total = len(ts_codes)
     print(f"扫描 {total} 只股票...\n", flush=True)
 
+    # 一次 groupby 建索引（原来每只股票做一次全表过滤，4936 只要 3~4 分钟）
+    groups = {k: v.sort_values("trade_date") for k, v in market_df.groupby("ts_code")}
+
     hits = []
     for i, ts_code in enumerate(ts_codes):
-        if (i + 1) % 500 == 0:
+        if (i + 1) % 1000 == 0:
             print(f"  进度: {i + 1}/{total}", flush=True)
-        stock_df = market_df[market_df["ts_code"] == ts_code].sort_values("trade_date").reset_index(drop=True)
-        if len(stock_df) < MIN_HISTORY:
+        stock_df = groups.get(ts_code)
+        if stock_df is None or len(stock_df) < MIN_HISTORY:
             continue
         close = stock_df["close"].values.astype(float)
         open_ = stock_df["open"].values.astype(float)
@@ -757,8 +1167,16 @@ def main():
     scan_p.add_argument("--no-enrich", action="store_true", help="不调 westock 补主营业务/概念")
     scan_p.add_argument("--max-enrich", type=int, default=None, help="最多补 N 只字段（已弃用，保留兼容）")
     scan_p.add_argument("--top", type=int, default=None, help="仅保留量能比值最高的 N 只（截断后再补字段/画图）")
-    scan_p.add_argument("--workers", type=int, default=8, help="并发补字段线程数")
+    scan_p.add_argument("--workers", type=int, default=2,
+                        help="并发补字段线程数（默认 2；≥4 时 westock 会返回降级数据，概念关联度变成 0）")
     scan_p.add_argument("--no-html", action="store_true", help="不生成 HTML 报告")
+    scan_p.add_argument("--source", default="auto", choices=["auto", "tushare", "tx", "westock"],
+                        help="全市场日线数据源：auto=tushare→腾讯行情→westock 依次兜底；tushare；tx=腾讯行情；westock=westock批量K线")
+
+    fill_p = sub.add_parser("fill", help="补漏：抓取缓存中缺失的股票并合并（westock 源限流兜底）")
+    fill_p.add_argument("--date", dest="end_date", default=None, help="监控日 YYYYMMDD")
+    fill_p.add_argument("--per-min", type=int, default=6, help="每分钟批次数（默认 6，越慢成功率越高）")
+    fill_p.add_argument("--workers", type=int, default=2, help="并发批次数")
 
     check_p = sub.add_parser("check", help="单股诊断（westock 日线）")
     check_p.add_argument("code", help="如 sz300866")
@@ -769,12 +1187,15 @@ def main():
     if args.command == "scan":
         hits = run_scan(limit=args.limit, refresh=args.refresh,
                         no_enrich=args.no_enrich, max_enrich=args.max_enrich,
-                        top=args.top, workers=args.workers, end_date=args.end_date)
+                        top=args.top, workers=args.workers, end_date=args.end_date,
+                        source=args.source)
         if hits:
             print_report(hits)
             write_csv(hits)
             if not args.no_html:
                 write_html(hits, monitor_date=args.end_date)
+    elif args.command == "fill":
+        fill_missing_westock(end_date=args.end_date, per_min=args.per_min, workers=args.workers)
     elif args.command == "check":
         check_single(args.code, end_date=args.end_date)
     else:
